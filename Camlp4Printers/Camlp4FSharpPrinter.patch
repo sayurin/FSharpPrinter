@@ -1,0 +1,583 @@
+--- .\OCaml.ml	Fri Aug 30 20:39:33 2013
++++ .\Camlp4FSharpPrinter.ml	Thu Nov 21 13:41:23 2013
+@@ -17,10 +17,11 @@
+  *)
+ 
+ open Format;
++open Camlp4;
+ 
+ module Id = struct
+-  value name = "Camlp4.Printers.OCaml";
+-  value version = Sys.ocaml_version;
++  value name = "Camlp4.Printers.FSharp";
++  value version = "1.0";
+ end;
+ 
+ module Make (Syntax : Sig.Camlp4Syntax) = struct
+@@ -68,7 +69,7 @@
+ 
+   module StringSet = Set.Make String;
+ 
+-  value infix_lidents = ["asr"; "land"; "lor"; "lsl"; "lsr"; "lxor"; "mod"; "or"];
++  value infix_lidents = ["asr"; "land"; "lor"; "lsl"; "lsr"; "lxor"; "mod"; "or"; "!="];
+ 
+   value is_infix =
+     let first_chars = ['='; '<'; '>'; '|'; '&'; '$'; '@'; '^'; '+'; '-'; '*'; '/'; '%'; '\\']
+@@ -86,7 +87,11 @@
+          "inherit"; "initializer"; "lazy"; "let"; "match"; "method"; "module";
+          "mutable"; "new"; "object";  "of";  "open"; "parser";  "private";  "rec"; "sig";
+          "struct";  "then";  "to";  "true";  "try";  "type";  "val"; "virtual";
+-         "when"; "while"; "with"] StringSet.empty
++         "when"; "while"; "with";
++         "abstract"; "base"; "const"; "default"; "elif"; "extern"; "global"; "inline";
++         "interface"; "member"; "namespace"; "null"; "override"; "public"; "return";
++         "static"; "void";
++        ] StringSet.empty
+       in fun s -> StringSet.mem s keywords;
+ 
+   module Lexer = Struct.Lexer.Make Token;
+@@ -154,7 +159,7 @@
+           do_print_comments_before loc f s
+     | [: :] -> () ];
+ 
+-  class printer ?curry_constr:(init_curry_constr = False) ?(comments = True) () =
++  class printer ?(comments = True) () =
+   object (o)
+ 
+     (** pipe means we are under a match case (try, function) *)
+@@ -165,11 +170,12 @@
+     method under_semi = {< semi = True >};
+     method reset_semi = {< semi = False >};
+     method reset =      {< pipe = False; semi = False >};
++    value alias = [];
++    method add_alias n = {< alias = n @ alias >};
+ 
+     value semisep : sep = ";;";
+     value no_semisep : sep = ""; (* used to mark where ";;" should not occur *)
+     value mode = if comments then `comments else `no_comments;
+-    value curry_constr = init_curry_constr;
+     value var_conversion = False;
+ 
+     method andsep : sep = "@]@ @[<2>and@ ";
+@@ -180,7 +186,6 @@
+     method set_semisep s = {< semisep = s >};
+     method set_comments b = {< mode = if b then `comments else `no_comments >};
+     method set_loc_and_comments = {< mode = `loc_and_comments >};
+-    method set_curry_constr b = {< curry_constr = b >};
+ 
+     method print_comments_before loc f =
+       match mode with
+@@ -209,13 +214,13 @@
+           | _ ->
+             match lex_string v with
+             [ (LIDENT s | UIDENT s | ESCAPED_IDENT s) when is_keyword s ->
+-                pp f "%s__" s
++                pp f "``%s``" s
+             | (LIDENT s | ESCAPED_IDENT s) when List.mem s infix_lidents ->
+                 pp f "( %s )" s
+             | SYMBOL s ->
+                 pp f "( %s )" s
+             | LIDENT s | UIDENT s | ESCAPED_IDENT s ->
+-                pp_print_string f s
++                pp_print_string f (if List.mem s alias then s ^ "_" else s)
+             | tok -> failwith (sprintf
+                       "Bad token used as an identifier: %s"
+                       (Token.to_string tok)) ] ] ];
+@@ -244,9 +249,12 @@
+       | Ast.MuAnt s -> o#anti f s ];
+ 
+     method rec_flag f = fun
+-      [ Ast.ReRecursive -> pp f "rec@ "
+-      | Ast.ReNil -> ()
+-      | Ast.ReAnt s -> o#anti f s ];
++      [ (Ast.ReRecursive, _)
++      (* fsharp hack, let ... and binding requires 'rec'. *)
++      | (Ast.ReNil, <:binding< $_$ and $_$ >>) -> pp f "rec@ "
++      | (Ast.ReNil, _) -> ()
++      | (Ast.ReAnt s, <:binding< $_$ and $_$ >>) -> failwith "rec_flag: ReAnt and BiAnd."
++      | (Ast.ReAnt s, _) -> o#anti f s ];
+ 
+     method virtual_flag f = fun
+       [ Ast.ViVirtual -> pp f "virtual@ "
+@@ -283,11 +291,26 @@
+       | <:match_case< $anti:s$ >> -> o#anti f s
+       | <:match_case< $a1$ | $a2$ >> ->
+           pp f "%a%a" o#match_case_aux a1 o#match_case_aux a2
+-      | <:match_case< $p$ -> $e$ >> ->
+-          pp f "@ | @[<2>%a@ ->@ %a@]" o#patt p o#under_pipe#expr e
++
+       | <:match_case< $p$ when $w$ -> $e$ >> ->
+-          pp f "@ | @[<2>%a@ when@ %a@ ->@ %a@]"
+-            o#patt p o#under_pipe#expr w o#under_pipe#expr e ];
++          let rec has_range =
++            fun
++            [ <:patt< $p1$ | $p2$ >> -> has_range p1 || has_range p2
++            | <:patt< $_$ .. $_$ >>  -> True
++            | _                      -> False ] in
++          if has_range p then
++            match w with
++            [ <:expr<>> -> pp f "@ | @[<2>__ch@ when@ %a@ ->@ %a@]"           o#range_patt p                     o#under_pipe#expr e
++            | _         -> pp f "@ | @[<2>__ch@ when@ (%a)@ &&@ %a@ ->@ %a@]" o#range_patt p o#under_pipe#expr w o#under_pipe#expr e ]
++          else
++            match w with
++            [ <:expr<>> -> pp f "@ | @[<2>%a@ ->@ %a@]"           o#patt p                     o#under_pipe#expr e
++            | _         -> pp f "@ | @[<2>%a@ when@ %a@ ->@ %a@]" o#patt p o#under_pipe#expr w o#under_pipe#expr e ] ];
++    method range_patt f =
++      fun
++      [ <:patt< $p1$ | $p2$ >>  -> pp f "%a || %a" o#range_patt p1  o#range_patt p2
++      | <:patt< $p1$ .. $p2$ >> -> pp f "%a <= __ch && __ch <= %a" o#simple_patt p1 o#simple_patt p2
++      | p                       -> pp f "__ch = %a" o#simple_patt p ];
+ 
+     method fun_binding f =
+       fun
+@@ -295,25 +318,29 @@
+       | `newtype i -> pp f "(type %s)" i ];
+ 
+     method binding f bi =
++      o#binding2 f (bi, [], []);
++    method binding2 f (bi, dup1, dup2) =
+       let () = o#node f bi Ast.loc_of_binding in
+       match bi with
+       [ <:binding<>> -> ()
+       | <:binding< $b1$ and $b2$ >> ->
+-          do { o#binding f b1; pp f o#andsep; o#binding f b2 }
++          do { o#binding2 f (b1, dup1, dup2); pp f o#andsep; o#binding2 f (b2, dup1, dup2) }
+       | <:binding< $p$ = $e$ >> ->
+           let (pl, e') =
+             match p with
+             [ <:patt< ($_$ : $_$) >> -> ([], e)
+             | _ -> expr_fun_args e ] in
++          let o1 = o#add_alias dup1 in
++          let o2 = o#add_alias dup2 in
+           match (p, e') with
+           [ (<:patt< $lid:_$ >>, <:expr< ($e'$ : $t$) >>) ->
+               pp f "%a :@ %a =@ %a"
+-                (list o#fun_binding "@ ") [`patt p::pl] o#ctyp t o#expr e'
++                (list o1#fun_binding "@ ") [`patt p::pl] o#ctyp t o2#expr e'
+           | (<:patt< $lid:_$ >>, _) ->
+-              pp f "%a @[<0>%a=@]@ %a" o#simple_patt
+-                p (list' o#fun_binding "" "@ ") pl o#expr e'
++              pp f "%a @[<0>%a=@]@ %a" o1#simple_patt
++                p (list' o#fun_binding "" "@ ") pl o2#expr e'
+           | _ ->
+-              pp f "%a =@ %a" o#simple_patt p o#expr e ]
++              pp f "%a =@ %a" o1#simple_patt p o2#expr e ]
+       | <:binding< $anti:s$ >> -> o#anti f s ];
+ 
+     method record_binding f bi =
+@@ -363,7 +390,7 @@
+ 
+     method patt_class_expr_fun_args f (p, ce) =
+       let (pl, ce) = class_expr_fun_args ce
+-      in pp f "%a =@]@ %a" (list o#simple_patt "@ ") [p::pl] o#class_expr ce;
++      in pp f "(%a) =@]@ %a" (list o#simple_patt ",@ ") [p::pl] o#class_expr ce;
+ 
+     method constrain f (t1, t2) =
+       pp f "@[<2>constraint@ %a =@ %a@]" o#ctyp t1 o#ctyp t2;
+@@ -441,7 +468,8 @@
+     let () = o#node f e Ast.loc_of_expr in
+     match e with
+     [ ((<:expr< let $rec:_$ $_$ in $_$ >> |
+-        <:expr< let module $_$ = $_$ in $_$ >>) as e) when semi ->
++        <:expr< let module $_$ = $_$ in $_$ >> |
++        <:expr< if $_$ then $_$ else $_$ >>) as e) when semi ->
+         pp f "(%a)" o#reset#expr e
+     | ((<:expr< match $_$ with [ $_$ ] >> |
+         <:expr< try $_$ with [ $_$ ] >> |
+@@ -455,10 +483,23 @@
+         pp f "@[<2>-.@ %a@]" o#dot_expr x (* same note as above *)
+     | <:expr< [$_$ :: $_$] >> -> o#expr_list_cons False f e
+     | <:expr@_loc< $lid:n$ $x$ $y$ >> when is_infix n ->
+-        pp f "@[<2>%a@ %s@ %a@]" o#apply_expr x n o#apply_expr y
++        let is_literal =
++          fun
++          [ <:expr< $int:_$ >> | <:expr< $nativeint:_$ >> | <:expr< $int64:_$ >> | <:expr< $int32:_$ >> | <:expr< $flo:_$ >> | <:expr< $chr:_$ >> | <:expr< $str:_$ >> -> True
++          | _ -> False ] in
++        match (n, y) with
++        [ ("=",  <:expr< None >>)                     -> o#expr f <:expr@_loc< Option.isNone $x$ >>
++        | ("<>", <:expr< None >>)                     -> o#expr f <:expr@_loc< Option.isSome $x$ >>
++        | ("=",  <:expr< [] >>)                       -> o#expr f <:expr@_loc< List.isEmpty $x$ >>
++        | ("<>", <:expr< [] >>)                       -> o#expr f <:expr@_loc< not (List.isEmpty $x$) >>
++        | ("=",  <:expr< $uid:uid$ >>)                -> o#expr f <:expr@_loc< match $x$ with [ $uid:uid$ -> True | _ -> False ] >>
++        | ("<>", <:expr< $uid:uid$ >>)                -> o#expr f <:expr@_loc< match $x$ with [ $uid:uid$ -> False | _ -> True ] >>
++        | ("==", _) when is_literal x || is_literal y -> o#expr f <:expr@_loc< $x$ = $y$ >>
++        | ("!=", _) when is_literal x || is_literal y -> o#expr f <:expr@_loc< $x$ <> $y$ >>
++        | (_, _) -> pp f "@[<2>%a@ %s@ %a@]" o#apply_expr x n o#apply_expr y ]
+     | <:expr< $x$ $y$ >> ->
+         let (a, al) = get_expr_args x [y] in
+-        if (not curry_constr) && Ast.is_expr_constructor a then
++        if Ast.is_expr_constructor a then
+           match al with
+           [ [ <:expr< ($tup:_$) >> ] ->
+               pp f "@[<2>%a@ (%a)@]" o#apply_expr x o#expr y
+@@ -468,7 +509,11 @@
+                  (* The #apply_expr below may put too much parens.
+                     However using #expr would be wrong: PR#5056. *)
+                  (list o#under_pipe#apply_expr ",@ ") al ]
+-        else pp f "@[<2>%a@]" (list o#apply_expr "@ ") [a::al]
++        else
++          (* fsharp constructor use tuple style. *)
++          match a with
++          [ <:expr< new $i$ >> -> pp f "@[<2>%a(%a)@]" o#ident i (list o#under_pipe#apply_expr ",@ ") al
++          | _                  -> pp f "@[<2>%a@ %a@]" o#apply_expr a (list o#under_pipe#apply_expr "@ ") al ]
+     | <:expr< $e1$.val := $e2$ >> ->
+         pp f "@[<2>%a :=@ %a@]" o#dot_expr e1 o#expr e2
+     | <:expr< $e1$ := $e2$ >> ->
+@@ -481,18 +526,23 @@
+         pp f "@[<2>fun@ %a@]" o#patt_expr_fun_args (`newtype i, e)
+     | <:expr< fun [ $a$ ] >> ->
+         pp f "@[<hv0>function%a@]" o#match_case a
++    | <:expr< if $e1$ then $e2$ else () >> ->
++        (* fsharp requires () at if condition block. *)
++        pp f "@[<hv0>@[<2>if@ %a@]@ @[<2>then@ %a@]@]"
++           o#under_pipe#expr e1 o#under_semi#expr e2
+     | <:expr< if $e1$ then $e2$ else $e3$ >> ->
++        (* fsharp requires () at if condition block. *)
+         pp f "@[<hv0>@[<2>if@ %a@]@ @[<2>then@ %a@]@ @[<2>else@ %a@]@]"
+-           o#expr e1 o#under_semi#expr e2 o#under_semi#expr e3
++           o#under_pipe#expr e1 o#under_semi#expr e2 o#under_semi#expr e3
+     | <:expr< lazy $e$ >> -> pp f "@[<2>lazy@ %a@]" o#simple_expr e
+     | <:expr< let $rec:r$ $bi$ in $e$ >> ->
+         match e with
+         [ <:expr< let $rec:_$ $_$ in $_$ >> ->
+             pp f "@[<0>@[<2>let %a%a in@]@ %a@]"
+-              o#rec_flag r o#binding bi o#reset_semi#expr e
++              o#rec_flag (r, bi) o#binding bi o#reset_semi#expr e
+         | _ ->
+             pp f "@[<hv0>@[<2>let %a%a@]@ @[<hv2>in@ %a@]@]"
+-              o#rec_flag r o#binding bi o#reset_semi#expr e ]
++              o#rec_flag (r, bi) o#binding bi o#reset_semi#expr e ]
+     | <:expr< let open $i$ in $e$ >> ->
+         pp f "@[<2>let open %a@]@ @[<2>in@ %a@]"
+              o#ident i o#reset_semi#expr e
+@@ -502,36 +552,44 @@
+     | <:expr< try $e$ with [ $a$ ] >> ->
+         pp f "@[<0>@[<hv2>try@ %a@]@ @[<0>with%a@]@]"
+           o#expr e o#match_case a
+-    | <:expr< assert False >> -> pp f "@[<2>assert@ false@]"
++    | <:expr< assert False >> -> pp f "@[<2>failwith@ \"assert@ false\"@]"
+     | <:expr< assert $e$ >> -> pp f "@[<2>assert@ %a@]" o#dot_expr e
+     | <:expr< let module $s$ = $me$ in $e$ >> ->
+           pp f "@[<2>let module %a =@ %a@]@ @[<2>in@ %a@]" o#var s o#module_expr me o#reset_semi#expr e
++    (*
+     | <:expr< object $cst$ end >> ->
+         pp f "@[<hv0>@[<hv2>object@ %a@]@ end@]" o#class_str_item cst
+     | <:expr< object ($p$ : $t$) $cst$ end >> ->
+         pp f "@[<hv0>@[<hv2>object @[<1>(%a :@ %a)@]@ %a@]@ end@]"
+-          o#patt p o#ctyp t o#class_str_item cst
++          o#patt p o#ctyp t o#class_str_item cst*)
+     | <:expr< object ($p$) $cst$ end >> ->
+-        pp f "@[<hv0>@[<hv2>object @[<2>(%a)@]@ %a@]@ end@]"
+-          o#patt p o#class_str_item cst
++        (*pp f "@[<hv0>@[<hv2>object @[<2>(%a)@]@ %a@]@ end@]"
++          o#patt p o#class_str_item cst*)
++        failwith "class_str_item called."
+     | e -> o#apply_expr f e ];
+ 
+     method apply_expr f e =
+     let () = o#node f e Ast.loc_of_expr in
+     match e with
+-    [ <:expr< new $i$ >> -> pp f "@[<2>new@ %a@]" o#ident i
++    [ <:expr< new $_$ >> -> failwith "invaild constructor call."
++    | e -> o#prefix_expr f e ];
++    method prefix_expr f e =
++    let () = o#node f e Ast.loc_of_expr in
++    match e with
++    [ <:expr< $e$.val >> -> pp f "@[<2>!%a@]" o#dot_expr e
+     | e -> o#dot_expr f e ];
+ 
+     method dot_expr f e =
+     let () = o#node f e Ast.loc_of_expr in
+     match e with
+-    [ <:expr< $e$.val >> -> pp f "@[<2>!@,%a@]" o#simple_expr e
++    [ <:expr@_loc< $e$ . $uid:_$ . $lid:i$ >> -> o#dot_expr f <:expr@_loc< $e$ . $lid:i$ >>
++    | <:expr< $e$.val >> -> pp f "@[<2>(%a)@]" o#prefix_expr e
+     | <:expr< $e1$ . $e2$ >> -> pp f "@[<2>%a.@,%a@]" o#dot_expr e1 o#dot_expr e2
+     | <:expr< $e1$ .( $e2$ ) >> ->
+-        pp f "@[<2>%a.@,(%a)@]" o#dot_expr e1 o#expr e2
+-    | <:expr< $e1$ .[ $e2$ ] >> ->
+-        pp f "%a.@[<1>[@,%a@]@,]" o#dot_expr e1 o#expr e2
+-    | <:expr< $e$ # $s$ >> -> pp f "@[<2>%a#@,%s@]" o#dot_expr e s
++        pp f "@[<2>%a.@,[%a]@]" o#dot_expr e1 o#expr e2
++    | <:expr@_loc< $e1$ .[ $e2$ ] >> ->
++        o#expr f <:expr@_loc< String.get $e1$ $e2$ >>
++    | <:expr< $e$ # $s$ >> -> pp f "@[<2>%a.@,%s@]" o#dot_expr e s
+     | e -> o#simple_expr f e ];
+ 
+     method simple_expr f e =
+@@ -565,13 +623,13 @@
+     | <:expr< { $b$ } >> ->
+         pp f "@[<hv0>@[<hv2>{%a@]@ }@]" o#record_binding b
+     | <:expr< { ($e$) with $b$ } >> ->
+-        pp f "@[<hv0>@[<hv2>{@ (%a)@ with%a@]@ }@]"
++        pp f "@[<hv0>@[<hv2>{@ %a@ with%a@]@ }@]"
+           o#expr e o#record_binding b
+     | <:expr< $str:s$ >> -> pp f "\"%s\"" s
+     | <:expr< while $e1$ do { $e2$ } >> ->
+         pp f "@[<2>while@ %a@ do@ %a@ done@]" o#expr e1 o#seq e2
+-    | <:expr< ~ $s$ >> -> pp f "~%s" s
+-    | <:expr< ~ $s$ : $e$ >> -> pp f "@[<2>~%s:@ %a@]" s o#dot_expr e
++    | <:expr< ~ $s$ >> -> pp f "(*named*)%s" s
++    | <:expr< ~ $s$ : $e$ >> -> pp f "@[<2>(*named:%s*)%a@]" s o#dot_expr e
+     | <:expr< ? $s$ >> -> pp f "?%s" s
+     | <:expr< ? $s$ : $e$ >> -> pp f "@[<2>?%s:@ %a@]" s o#dot_expr e
+     | <:expr< ` $lid:s$ >> -> pp f "`%a" o#var s
+@@ -608,7 +666,7 @@
+ 
+     method patt f p =
+     let () = o#node f p Ast.loc_of_patt in match p with
+-    [ <:patt< ( $p1$ as $p2$ ) >> -> pp f "@[<1>(%a@ as@ %a)@]" o#patt p1 o#patt p2
++    [ <:patt< ( $p1$ as $p2$ ) >> -> pp f "@[<1>%a@ as@ %a@]" o#patt p1 o#patt p2
+     | <:patt< $i$ = $p$ >> -> pp f "@[<2>%a =@ %a@]" o#var_ident i o#patt p
+     | <:patt< $p1$; $p2$ >> -> pp f "%a;@ %a" o#patt p1 o#patt p2
+     | p -> o#patt1 f p ];
+@@ -618,8 +676,8 @@
+     | p -> o#patt2 f p ];
+ 
+     method patt2 f = fun
+-    [ (* <:patt< ( $tup:p$ ) >> -> pp f "@[<1>(%a)@]" o#patt3 p
+-    | *) p -> o#patt3 f p ];
++    [ <:patt< ( $tup:p$ ) >> -> pp f "@[<1>%a@]" o#patt3 p
++    | p -> o#patt3 f p ];
+ 
+     method patt3 f = fun
+     [ <:patt< $p1$ .. $p2$ >> -> pp f "@[<2>%a@ ..@ %a@]" o#patt3 p1 o#patt4 p2
+@@ -642,8 +700,6 @@
+         let (a, al) = get_patt_args x [y] in
+         if not (Ast.is_patt_constructor a) then
+           Format.eprintf "WARNING: strange pattern application of a non constructor@."
+-        else if curry_constr then
+-          pp f "@[<2>%a@]" (list o#simple_patt "@ ") [a::al]
+         else
+           match al with
+           [ [ <:patt< ($tup:_$) >> ] ->
+@@ -661,7 +717,6 @@
+     | <:patt< $anti:s$ >> -> o#anti f s
+     | <:patt< _ >> -> pp f "_"
+     | <:patt< ( module $m$ ) >> -> pp f "(module %s)" m
+-    | <:patt< ( $tup:p$ ) >> -> pp f "@[<1>(%a)@]" o#patt3 p
+     | <:patt< { $p$ } >> -> pp f "@[<hv2>{@ %a@]@ }" o#patt p
+     | <:patt< $str:s$ >> -> pp f "\"%s\"" s
+     | <:patt< ( $p$ : $t$ ) >> -> pp f "@[<1>(%a :@ %a)@]" o#patt p o#ctyp t
+@@ -671,22 +726,22 @@
+     | <:patt< $int:s$ >> -> o#numeric f s ""
+     | <:patt< $flo:s$ >> -> o#numeric f s ""
+     | <:patt< $chr:s$ >> -> pp f "'%s'" (ocaml_char s)
+-    | <:patt< ~ $s$ >> -> pp f "~%s" s
++    | <:patt< ~ $s$ >> -> pp f "(*named*)%s" s
+     | <:patt< ` $uid:s$ >> -> pp f "`%a" o#var s
+     | <:patt< # $i$ >> -> pp f "@[<2>#%a@]" o#ident i
+     | <:patt< [| $p$ |] >> -> pp f "@[<2>[|@ %a@]@ |]" o#patt p
+-    | <:patt< ~ $s$ : ($p$) >> -> pp f "@[<2>~%s:@ (%a)@]" s o#patt p
+-    | <:patt< ? $s$ >> -> pp f "?%s" s
++    | <:patt< ~ $s$ : ($p$) >> -> pp f "@[<2>(*named:%s*)(%a)@]" s o#patt p
++    | <:patt< ? $s$ >> -> pp f "(*optional*)%s" s
+     | <:patt< ?($p$) >> ->
+-          pp f "@[<2>?(%a)@]" o#patt_tycon p
++          pp f "@[<2>(*optional*)(%a)@]" o#patt_tycon p
+     | <:patt< ? $s$ : ($p$) >> ->
+-          pp f "@[<2>?%s:@,@[<1>(%a)@]@]" s o#patt_tycon p
++          pp f "@[<2>(*optional*)%s:@,@[<1>(%a)@]@]" s o#patt_tycon p
+     | <:patt< ?($p$ = $e$) >> ->
+-          pp f "@[<2>?(%a =@ %a)@]" o#patt_tycon p o#expr e
++          pp f "@[<2>(*optional:%a*)(%a)@]" o#expr e o#patt_tycon p
+     | <:patt< ? $s$ : ($p$ = $e$) >> ->
+-          pp f "@[<2>?%s:@,@[<1>(%a =@ %a)@]@]" s o#patt_tycon p o#expr e
++          pp f "@[<2>(*optional:%a*)%s:@,@[<1>(%a)@]@]" o#expr e s o#patt_tycon p
+     | <:patt< $_$ $_$ >> | <:patt< ($_$ as $_$) >> | <:patt< $_$ | $_$ >> |
+-      <:patt< $_$ .. $_$ >> | <:patt< $_$, $_$ >> |
++      <:patt< $_$ .. $_$ >> | <:patt< $_$, $_$ >> | <:patt< ( $tup:_$ ) >> |
+       <:patt< $_$; $_$ >> | <:patt< $_$ = $_$ >> | <:patt< lazy $_$ >> as p ->
+           pp f "@[<1>(%a)@]" o#patt p
+     ];
+@@ -834,14 +889,46 @@
+           pp f "%a%(%)" o#anti s semisep ];
+ 
+     method str_item f st =
++      let rec list_bi = fun
++      [ <:binding<>>                -> []
++      | <:binding< $lid:i$ = $_$ >> -> [i]
++      | <:binding< $b1$ and $b2$ >> -> list_bi b1 @ list_bi b2
++      | _ -> assert False ] in
++      let rec list_st = fun
++      [ <:str_item< value $rec:_$ $bi$ >> -> list_bi bi
++      | <:str_item< $st1$; $st2$ >>       -> list_st st1 @ list_st st2
++      | _                                 -> [] ] in
++      let rec duplicate = fun
++      [ [hd :: tl] when List.mem hd tl -> [hd :: duplicate tl]
++      | [_ :: tl]                      -> duplicate tl
++      | []                             -> [] ] in
++      o#str_item2 f (st, duplicate (list_st st), [], []);
++    method str_item2 f (st, dup1, dup2, dup3) =
+       let () = o#node f st Ast.loc_of_str_item in
++      let rec list_bi = fun
++      [ <:binding<>>                -> []
++      | <:binding< $lid:i$ = $_$ >> -> [i]
++      | <:binding< $b1$ and $b2$ >> -> list_bi b1 @ list_bi b2
++      | _ -> assert False ] in
+       match st with
+       [ <:str_item<>> -> ()
+       | <:str_item< $st$; $<:str_item<>>$ >> |
+         <:str_item< $<:str_item<>>$; $st$ >> ->
+-          o#str_item f st
++          o#str_item2 f (st, dup1, dup2, dup3)
++      | <:str_item< ($_$; $_$); $_$ >> -> assert False
+       | <:str_item< $st1$; $st2$ >> ->
+-            do { o#str_item f st1; cut f; o#str_item f st2 }
++          let update (dup1, dup2, dup3) = fun
++          [ <:str_item< value $rec:_$ $bi$ >> -> let current = list_bi bi in
++                                                 let (dup3, dup2) = List.partition (fun i -> List.mem i current) dup2 in
++                                                 let (temp, dup1) = List.partition (fun i -> List.mem i current) dup1 in
++                                                 (dup1, dup2 @ temp, dup3)
++          | _                                 -> (dup1, dup2, dup3) ] in
++          do {
++            let (dup1, dup2, dup3) = update (dup1, dup2, dup3) st1 in
++            o#str_item2 f (st1, dup1, dup2, dup3);
++            cut f;
++            let (dup1, dup2, dup3) = update (dup1, dup2, dup3) st2 in
++            o#str_item2 f (st2, dup1, dup2, dup3) }
+       | <:str_item< exception $t$ >> ->
+             pp f "@[<2>exception@ %a%(%)@]" o#ctyp t semisep
+       | <:str_item< exception $t$ = $sl$ >> ->
+@@ -871,7 +958,7 @@
+       | <:str_item< type $t$ >> ->
+             pp f "@[<hv0>@[<hv2>type %a@]%(%)@]" o#ctyp t semisep
+       | <:str_item< value $rec:r$ $bi$ >> ->
+-            pp f "@[<2>%s %a%a%(%)@]" o#value_let o#rec_flag r o#binding bi semisep
++            pp f "@[<2>%s %a%a%(%)@]" o#value_let o#rec_flag (r, bi) o#binding2 (bi, dup2, (if r = Ast.ReRecursive then dup2 else dup2 @ dup3)) semisep
+       | <:str_item< $exp:e$ >> ->
+             pp f "@[<2>let _ =@ %a%(%)@]" o#expr e semisep
+       | <:str_item< include $me$ >> ->
+@@ -879,7 +966,7 @@
+       | <:str_item< class type $ct$ >> ->
+             pp f "@[<2>class type %a%(%)@]" o#class_type ct semisep
+       | <:str_item< class $ce$ >> ->
+-            pp f "@[<hv2>class %a%(%)@]" o#class_declaration ce semisep
++            pp f "@[<hv2>type %a%(%)@]" o#class_declaration ce semisep
+       | <:str_item< module rec $mb$ >> ->
+             pp f "@[<2>module rec %a%(%)@]" o#module_rec_binding mb semisep
+       | <:str_item< # $_$ $_$ >> -> ()
+@@ -952,25 +1039,26 @@
+     let () = o#node f ce Ast.loc_of_class_expr in
+     match ce with
+     [ <:class_expr< $ce$ $e$ >> ->
+-          pp f "@[<2>%a@ %a@]" o#class_expr ce o#apply_expr e
++          pp f "@[<2>%a@ (*inherit?*)%a@]" o#class_expr ce o#apply_expr e
+     | <:class_expr< $id:i$ >> ->
+           pp f "@[<2>%a@]" o#ident i
+     | <:class_expr< $id:i$ [ $t$ ] >> ->
+-          pp f "@[<2>@[<1>[%a]@]@ %a@]" o#class_params t o#ident i
++          pp f "@[<2>@ %a<%a>@]" o#ident i o#class_params t
+     | <:class_expr< virtual $lid:i$ >> ->
+           pp f "@[<2>virtual@ %a@]" o#var i
+     | <:class_expr< virtual $lid:i$ [ $t$ ] >> ->
+-          pp f "@[<2>virtual@ @[<1>[%a]@]@ %a@]" o#class_params t o#var i
++          pp f "@[<2>virtual@ %a<%a>@]" o#var i o#class_params t
+     | <:class_expr< fun $p$ -> $ce$ >> ->
+           pp f "@[<2>fun@ %a@ ->@ %a@]" o#simple_patt p o#class_expr ce
+     | <:class_expr< let $rec:r$ $bi$ in $ce$ >> ->
+           pp f "@[<2>let %a%a@]@ @[<2>in@ %a@]"
+-            o#rec_flag r o#binding bi o#class_expr ce
++            o#rec_flag (r, bi) o#binding bi o#class_expr ce
+     | <:class_expr< object $cst$ end >> ->
+-          pp f "@[<hv0>@[<hv2>object %a@]@ end@]" o#class_str_item cst
+-    | <:class_expr< object ($p$) $cst$ end >> ->
+-          pp f "@[<hv0>@[<hv2>object @[<1>(%a)@]@ %a@]@ end@]"
+-            o#patt p o#class_str_item cst
++          (*pp f "@[<hv0>@[<hv2>object %a@]@ end@]" o#class_str_item cst*)
++          failwith "class_str_item called."
++    | <:class_expr< object ($lid:id$) $cst$ end >> ->
++          pp f "@[<hv0>@[<hv2>class @[<1>@]@ %a@]@ end@]"
++            o#class_str_item (cst, id)
+     | <:class_expr< ( $ce$ : $ct$ ) >> ->
+           pp f "@[<1>(%a :@ %a)@]" o#class_expr ce o#class_type ct
+     | <:class_expr< $anti:s$ >> -> o#anti f s
+@@ -1036,29 +1124,42 @@
+       | <:class_sig_item< $anti:s$ >> ->
+             pp f "%a%(%)" o#anti s no_semisep ];
+ 
+-    method class_str_item f cst =
++    method class_str_item f (cst, id) =
+       let () = o#node f cst Ast.loc_of_class_str_item in
++      let rec class_expr_args el = fun
++        [ <:class_expr< $ce$ $e$ >> -> class_expr_args [e :: el] ce
++        | ce                        -> (el, ce) ] in
+       match cst with
+       [ <:class_str_item<>> -> ()
+       | <:class_str_item< $cst$; $<:class_str_item<>>$ >> |
+         <:class_str_item< $<:class_str_item<>>$; $cst$ >> ->
+-          o#class_str_item f cst
++          o#class_str_item f (cst, id)
+       | <:class_str_item< $cst1$; $cst2$ >> ->
+-            do { o#class_str_item f cst1; cut f; o#class_str_item f cst2 }
++            do { o#class_str_item f (cst1, id); cut f; o#class_str_item f (cst2, id) }
+       | <:class_str_item< constraint $t1$ = $t2$ >> ->
+             pp f "@[<2>constraint %a =@ %a%(%)@]" o#ctyp t1 o#ctyp t2 no_semisep
+       | <:class_str_item< inherit $override:ov$ $ce$ >> ->
+-            pp f "@[<2>inherit%a@ %a%(%)@]" o#override_flag ov o#class_expr ce no_semisep
++            let (el, ce) = class_expr_args [] ce in
++            pp f "@[<2>inherit%a@ %a (%a)%(%)@]" o#override_flag ov o#class_expr ce (list o#apply_expr ",@ ") el no_semisep
+       | <:class_str_item< inherit $override:ov$ $ce$ as $lid:s$ >> ->
+-            pp f "@[<2>inherit%a@ %a as@ %a%(%)@]" o#override_flag ov o#class_expr ce o#var s no_semisep
++            let (el, ce) = class_expr_args [] ce in
++            pp f "@[<2>inherit%a@ %a (%a)(*as@ %a*)%(%)@]" o#override_flag ov o#class_expr ce (list o#apply_expr ",@ ") el o#var s no_semisep
+       | <:class_str_item< initializer $e$ >> ->
+             pp f "@[<2>initializer@ %a%(%)@]" o#expr e no_semisep
++      | <:class_str_item< method $override:ov$ $private:pr$ $s$ = fun $p$ -> $e$ >> when is_irrefut_patt p ->
++            let (pl, e) = expr_fun_args e in
++            pp f "@[<2>member%a %a%s.%a@ %a@ =@ %a%(%)@]"
++              o#override_flag ov o#private_flag pr id o#var s (list o#fun_binding "@ ") [`patt p :: pl] o#expr e no_semisep
+       | <:class_str_item< method $override:ov$ $private:pr$ $s$ = $e$ >> ->
+-            pp f "@[<2>method%a %a%a =@ %a%(%)@]"
+-              o#override_flag ov o#private_flag pr o#var s o#expr e no_semisep
++            pp f "@[<2>member%a %a%s.%a =@ %a%(%)@]"
++              o#override_flag ov o#private_flag pr id o#var s o#expr e no_semisep
++      | <:class_str_item< method $override:ov$ $private:pr$ $s$ : $t$ = fun $p$ -> $e$ >> when is_irrefut_patt p ->
++            let (pl, e) = expr_fun_args e in
++            pp f "@[<2>member%a %a%s.%a@ %a@ :@ %a =@ %a%(%)@]"
++              o#override_flag ov o#private_flag pr id o#var s (list o#fun_binding "@ ") [`patt p :: pl] o#ctyp t o#expr e no_semisep
+       | <:class_str_item< method $override:ov$ $private:pr$ $s$ : $t$ = $e$ >> ->
+-            pp f "@[<2>method%a %a%a :@ %a =@ %a%(%)@]"
+-              o#override_flag ov o#private_flag pr o#var s o#ctyp t o#expr e no_semisep
++            pp f "@[<2>member%a %a%s.%a :@ %a =@ %a%(%)@]"
++              o#override_flag ov o#private_flag pr id o#var s o#ctyp t o#expr e no_semisep
+       | <:class_str_item< method virtual $private:pr$ $s$ : $t$ >> ->
+             pp f "@[<2>method virtual@ %a%a :@ %a%(%)@]"
+               o#private_flag pr o#var s o#ctyp t no_semisep
+@@ -1066,8 +1167,8 @@
+             pp f "@[<2>%s virtual %a%a :@ %a%(%)@]"
+               o#value_val o#mutable_flag mu o#var s o#ctyp t no_semisep
+       | <:class_str_item< value $override:ov$ $mutable:mu$ $s$ = $e$ >> ->
+-            pp f "@[<2>%s%a %a%a =@ %a%(%)@]"
+-              o#value_val o#override_flag ov o#mutable_flag mu o#var s o#expr e no_semisep
++            pp f "@[<2>let%a %a%a =@ %a%(%)@]"
++              o#override_flag ov o#mutable_flag mu o#var s o#expr e no_semisep
+       | <:class_str_item< $anti:s$ >> ->
+             pp f "%a%(%)" o#anti s no_semisep ];
+ 
+@@ -1113,11 +1214,9 @@
+   value margin = ref 78;
+   value comments = ref True;
+   value locations = ref False;
+-  value curry_constr = ref False;
+ 
+   value print output_file fct =
+-    let o = new printer ~comments:comments.val
+-                        ~curry_constr:curry_constr.val () in
++    let o = new printer ~comments:comments.val () in
+     let o = o#set_semisep semisep.val in
+     let o = if locations.val then o#set_loc_and_comments else o in
+     with_outfile output_file
+@@ -1147,10 +1246,10 @@
+   Options.add "-sep" (Arg.String (fun s -> semisep.val := check_sep s))
+     " Use this string between phrases.";
+ 
+-  Options.add "-curry-constr" (Arg.Set curry_constr) "Use currified constructors.";
+-
+   Options.add "-no_comments" (Arg.Clear comments) "Do not add comments.";
+ 
+   Options.add "-add_locations" (Arg.Set locations) "Add locations as comment.";
+ 
+ end;
++
++module M = Camlp4.Register.OCamlPrinter Id MakeMore;
