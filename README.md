@@ -7,8 +7,10 @@ FSharpPrinter
    the patched file (version 4.01.0).
 
 To compile this,
-```$ ocamlc -I +camlp4 -pp camlp4rf -c Camlp4FSharpPrinter.ml
+```
+$ ocamlc -I +camlp4 -pp camlp4rf -c Camlp4FSharpPrinter.ml
 ```
 To use this,
-```$ camlp4of -printer Camlp4FSharpPrinter -o fsharp-source.ml ocaml-source.ml
+```
+$ camlp4of -printer Camlp4FSharpPrinter -o fsharp-source.ml ocaml-source.ml
 ```
